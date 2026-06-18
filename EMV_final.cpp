@@ -1071,15 +1071,45 @@ public:
         std::string txType = selectTransactionType();
         std::cout << SEP << '\n';
 
-        // Step 4 — Authentication (PIN or password, always required)
-        std::cout << "Authentication required for "
-                  << txType << " transaction.\n" << SEP << '\n';
-        if (!bank.cardAuthentication(card)) {
-            std::cout << "Transaction aborted due to failed authentication.\n";
-            return;
+        // Step 4 — Conditional authentication
+        //
+        // Rules:
+        //   Contact     → always requires PIN / password.
+        //   Contactless → only requires authentication if the amount
+        //                 exceeds the CONTACTLESS_LIMIT_AUD threshold
+        //                 (converted to AUD for a consistent baseline).
+        //
+        constexpr double CONTACTLESS_LIMIT_AUD = 100.0;
+        double amountInAUD = converter.convert(amount, merchantCurr, "AUD");
+        bool authRequired  = (txType == "Contact") ||
+                             (amountInAUD > CONTACTLESS_LIMIT_AUD);
+
+        if (authRequired) {
+            if (txType == "Contactless") {
+                std::cout << "Contactless limit exceeded ("
+                          << std::fixed << std::setprecision(2)
+                          << amountInAUD << " AUD > "
+                          << CONTACTLESS_LIMIT_AUD << " AUD limit).\n"
+                          << "Authentication required.\n" << SEP << '\n';
+            } else {
+                std::cout << "Contact transaction — authentication required.\n"
+                          << SEP << '\n';
+            }
+
+            if (!bank.cardAuthentication(card)) {
+                std::cout << "Transaction aborted due to failed authentication.\n";
+                return;
+            }
+            std::cout << "Authentication successful. Proceeding with payment.\n"
+                      << SEP << '\n';
+        } else {
+            std::cout << "Contactless payment approved without authentication.\n"
+                      << "  Amount: "
+                      << std::fixed << std::setprecision(2)
+                      << amountInAUD << " AUD (limit: "
+                      << CONTACTLESS_LIMIT_AUD << " AUD).\n"
+                      << SEP << '\n';
         }
-        std::cout << "Authentication successful. Proceeding with payment.\n"
-                  << SEP << '\n';
 
         // Step 5 — Payment (with automatic currency conversion)
         if (!bank.processPayment(card, amount, merchantCurr, converter)) {
@@ -1282,17 +1312,28 @@ int main()
                   << SEP << '\n';
 
         // ================================================================
-        //  ACT 1 — Two successful transactions
+        //  ACT 1 — Contactless under limit (no auth required)
+        //  Card A is EUR; terminal charges AUD. 49.99 AUD ≈ 30 EUR < 100 AUD
         // ================================================================
-        std::cout << "\n>>> ACT 1: Valid transactions\n";
-
-        // Transaction 1a — PASS auth
-        std::cout << "\n[Enter card: 4338908386379407  then password: password123]\n";
+        std::cout << "\n>>> ACT 1a: Contactless UNDER limit — no authentication\n"
+                  << "[Enter card: 4338908386379407  — no PIN/password needed]\n";
         terminal.runTransaction(bank, converter, 49.99, "AUD", "Coffee Shop");
 
-        // Transaction 1b — PIN auth
-        std::cout << "\n[Enter card: 4104332181960018  then PIN: 1234]\n";
-        terminal.runTransaction(bank, converter, 120.00, "AUD", "Supermarket");
+        // ================================================================
+        //  ACT 1b — Contactless OVER limit (auth triggered automatically)
+        //  Card B is USD; 150 AUD > 100 AUD limit → PIN required
+        // ================================================================
+        std::cout << "\n>>> ACT 1b: Contactless OVER limit — authentication required\n"
+                  << "[Enter card: 4104332181960018  then PIN: 1234]\n";
+        terminal.runTransaction(bank, converter, 150.00, "AUD", "Electronics Store");
+
+        // ================================================================
+        //  ACT 1c — Contact transaction (auth always required)
+        //  Card C is USD; amount is small but Contact → PIN always required
+        // ================================================================
+        std::cout << "\n>>> ACT 1c: Contact transaction — authentication always required\n"
+                  << "[Enter card: 5300524278680116  then PIN: 1278]\n";
+        terminal.runTransaction(bank, converter, 25.00, "AUD", "Pharmacy");
 
         // ================================================================
         //  ACT 2 — Invalid card detection
@@ -1301,15 +1342,16 @@ int main()
         // ================================================================
         std::cout << "\n>>> ACT 2: Invalid card detection\n"
                   << "[Enter in order: 41043321819 → 4104332181960O18 → "
-                     "4104332181960011 → 4012888888881881 → 5300524278680116  PIN: 1278]\n";
-        terminal.runTransaction(bank, converter, 25.00, "AUD", "Pharmacy");
+                     "4104332181960011 → 4012888888881881 → 4338908386379407  pw: password123]\n";
+        terminal.runTransaction(bank, converter, 20.00, "AUD", "Bakery");
 
         // ================================================================
         //  ACT 3 — Wrong PIN lockout (3 wrong attempts)
         // ================================================================
         std::cout << "\n>>> ACT 3: Wrong PIN lockout\n"
-                  << "[Enter card: 4104332181960018  then PIN: 0000 three times]\n";
-        terminal.runTransaction(bank, converter, 50.00, "AUD", "Electronics Store");
+                  << "[Enter card: 4104332181960018  then PIN: 0000 three times]\n"
+                  << "[150 AUD > 100 AUD limit so PIN is triggered on contactless]\n";
+        terminal.runTransaction(bank, converter, 150.00, "AUD", "Hotel");
 
         // ================================================================
         //  Receipt — only shown if at least one transaction succeeded
