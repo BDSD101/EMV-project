@@ -6,13 +6,21 @@
  * flow including card validation, RSA/AES encryption, PIN/password
  * authentication, and transaction management.
  *
+ * The terminal prompts the operator to enter a card number at the start of
+ * every transaction. The bank looks up the card in its encrypted database,
+ * verifies all fields, then challenges the cardholder for their PIN or
+ * password — regardless of whether the transaction is Contactless or Contact.
+ *
  * Cryptography: Crypto++ 8.x (RSA-2048 OAEP-SHA256, AES-256-CBC, SHA-384)
  * Standard:     C++17
  *
- * Build:
+ * Build (macOS / Homebrew):
  *   g++ -std=c++17 EMV6.cpp -o emv -lcryptopp \
  *       -I$(brew --prefix cryptopp)/include \
  *       -L$(brew --prefix cryptopp)/lib
+ *
+ * Build (Linux):
+ *   g++ -std=c++17 EMV6.cpp -o emv -lcryptopp
  *
  * @note    This is a demonstration/educational project. Credentials and card
  *          data are stored in plain-text CSV files for simplicity; a production
@@ -37,6 +45,8 @@
 #include <algorithm>
 #include <iomanip>
 #include <filesystem>
+#include <map>
+#include <cmath>
 
 // ============================================================
 //  Crypto++ headers
@@ -59,18 +69,18 @@ namespace fs = std::filesystem;
 //  Global constants
 // ============================================================
 
-/// Maximum number of consecutive authentication attempts before lockout.
+/// Maximum consecutive authentication attempts before lockout.
 constexpr int MAX_ATTEMPTS = 3;
 
-/// AES key sizes in bytes (128 / 192 / 256 bit).
+/// AES key sizes in bytes.
 const int AES_128_KEY_SIZE = CryptoPP::AES::DEFAULT_KEYLENGTH; // 16
 const int AES_192_KEY_SIZE = 24;
 const int AES_256_KEY_SIZE = CryptoPP::AES::MAX_KEYLENGTH;     // 32
 
-/// Separator line used throughout console output.
-const std::string SEPARATOR = "======================================================";
+/// Visual separator for console output.
+const std::string SEP = "======================================================";
 
-/// Lazily populated with the bank's public key after the bank object is created.
+/// Populated with the bank's RSA public key after Bank construction.
 CryptoPP::RSA::PublicKey BANK_PUBLIC_KEY{};
 
 // ============================================================
@@ -78,23 +88,10 @@ CryptoPP::RSA::PublicKey BANK_PUBLIC_KEY{};
 // ============================================================
 
 /**
- * @brief Generates a 2048-bit RSA key pair.
- * @param[out] publicKey  Populated public key.
- * @param[out] privateKey Populated private key.
- */
-void generateRSAKeys(CryptoPP::RSA::PublicKey& publicKey,
-                     CryptoPP::RSA::PrivateKey& privateKey)
-{
-    CryptoPP::AutoSeededRandomPool rng;
-    privateKey.GenerateRandomWithKeySize(rng, 2048);
-    publicKey.AssignFrom(privateKey);
-}
-
-/**
  * @brief  Encrypts plaintext with RSA-OAEP-SHA256 and Base64-encodes the result.
  * @param  plaintext  Data to encrypt.
- * @param  publicKey  RSA public key used for encryption.
- * @return Base64-encoded ciphertext.
+ * @param  publicKey  RSA public key.
+ * @return Base64-encoded ciphertext string.
  */
 std::string encryptRSA(const std::string& plaintext,
                        CryptoPP::RSA::PublicKey& publicKey)
@@ -115,8 +112,8 @@ std::string encryptRSA(const std::string& plaintext,
 
 /**
  * @brief  Decrypts a Base64-encoded RSA-OAEP-SHA256 ciphertext.
- * @param  encoded     Base64-encoded ciphertext produced by encryptRSA().
- * @param  privateKey  RSA private key used for decryption.
+ * @param  encoded     Ciphertext produced by encryptRSA().
+ * @param  privateKey  RSA private key.
  * @return Recovered plaintext.
  */
 std::string decryptRSA(const std::string& encoded,
@@ -141,11 +138,10 @@ std::string decryptRSA(const std::string& encoded,
 // ============================================================
 
 /**
- * @brief  Generates a random AES key of the requested size.
- * @param  keyLength  Must be AES_128_KEY_SIZE, AES_192_KEY_SIZE, or
- *                    AES_256_KEY_SIZE.
- * @return SecByteBlock containing the key material.
- * @throws std::invalid_argument if keyLength is not a valid AES size.
+ * @brief  Generates a random AES key of the requested byte length.
+ * @param  keyLength  16, 24, or 32 bytes (128 / 192 / 256 bit).
+ * @return SecByteBlock containing random key material.
+ * @throws std::invalid_argument on unsupported key length.
  */
 CryptoPP::SecByteBlock generateAESKey(int keyLength)
 {
@@ -156,7 +152,6 @@ CryptoPP::SecByteBlock generateAESKey(int keyLength)
         throw std::invalid_argument(
             "Invalid AES key length. Choose 128, 192, or 256 bits.");
     }
-
     CryptoPP::AutoSeededRandomPool rng;
     CryptoPP::SecByteBlock key(keyLength);
     rng.GenerateBlock(key, key.size());
@@ -164,7 +159,7 @@ CryptoPP::SecByteBlock generateAESKey(int keyLength)
 }
 
 /**
- * @brief  Generates a random AES initialisation vector (16 bytes).
+ * @brief  Generates a random 16-byte AES initialisation vector.
  * @return SecByteBlock containing the IV.
  */
 CryptoPP::SecByteBlock generateAESIV()
@@ -178,9 +173,9 @@ CryptoPP::SecByteBlock generateAESIV()
 /**
  * @brief  Encrypts plaintext with AES-256-CBC.
  * @param  plaintext  Data to encrypt.
- * @param  key        AES key (SecByteBlock).
- * @param  iv         Initialisation vector (SecByteBlock).
- * @return Raw ciphertext bytes as a std::string.
+ * @param  key        AES key.
+ * @param  iv         Initialisation vector.
+ * @return Raw ciphertext as a std::string.
  */
 std::string encryptAES(const std::string& plaintext,
                        const CryptoPP::SecByteBlock& key,
@@ -220,9 +215,9 @@ std::string decryptAES(const std::string& cipher,
 // ============================================================
 
 /**
- * @brief  Computes a SHA-384 hex digest of the input string.
- * @param  input  Data to hash (e.g. a PIN or password).
- * @return Uppercase hex string (96 characters).
+ * @brief  Computes a SHA-384 hex digest.
+ * @param  input  Data to hash (PIN digits, password string, etc.).
+ * @return 96-character uppercase hex string.
  */
 std::string hashSHA384(const std::string& input)
 {
@@ -247,12 +242,12 @@ void clearInputBuffer()
 }
 
 /**
- * @brief  Returns the local date-time formatted as "HH:MM HRS - DD/MM/YY AEST".
+ * @brief  Returns local date-time as "HH:MM HRS - DD/MM/YY AEST".
  * @return Formatted date-time string.
  */
 std::string getCurrentDateTime()
 {
-    std::time_t t = std::time(nullptr);
+    std::time_t t   = std::time(nullptr);
     std::tm*    now = std::localtime(&t);
 
     std::ostringstream oss;
@@ -260,10 +255,9 @@ std::string getCurrentDateTime()
         << std::setw(2) << std::setfill('0') << now->tm_min
         << " HRS - "
         << std::setw(2) << std::setfill('0') << now->tm_mday << '/'
-        << std::setw(2) << std::setfill('0') << (now->tm_mon + 1) << '/'
+        << std::setw(2) << std::setfill('0') << (now->tm_mon + 1)  << '/'
         << std::setw(2) << std::setfill('0') << (now->tm_year % 100)
         << " AEST";
-
     return oss.str();
 }
 
@@ -275,17 +269,12 @@ std::string getCurrentDateTime()
  * @class UserData
  * @brief Stores a cardholder's personal details and manages account numbering.
  *
- * Account numbers are auto-incremented by reading the last row of userdata.csv
- * so each new user receives a unique sequential number.
+ * Account numbers are auto-incremented by reading the last row of
+ * userdata.csv so each new user receives a unique sequential number.
  */
 class UserData
 {
 public:
-    /**
-     * @param firstName Cardholder first name.
-     * @param lastName  Cardholder last name.
-     * @param address   Cardholder billing address.
-     */
     UserData(const std::string& firstName,
              const std::string& lastName,
              const std::string& address)
@@ -297,33 +286,11 @@ public:
     /// Prints cardholder information to stdout.
     void displayUserInfo() const
     {
-        std::cout << SEPARATOR << '\n'
+        std::cout << SEP << '\n'
                   << "  Name:    " << firstName_ << ' ' << lastName_ << '\n'
                   << "  Address: " << address_   << '\n'
                   << "  Account: " << accountNumber_ << '\n'
-                  << SEPARATOR << '\n';
-    }
-
-    /**
-     * @brief  Prompts the user to pick PIN or Password authentication.
-     * @return "PIN" or "Password".
-     */
-    std::string getAuthenticationChoice() const
-    {
-        int choice = 0;
-        std::cout << "Choose authentication method: 1) PIN  2) Password: ";
-
-        while (true) {
-            std::cin >> choice;
-            if (std::cin.fail() || (choice != 1 && choice != 2)) {
-                clearInputBuffer();
-                std::cout << "Invalid input. Enter 1 (PIN) or 2 (Password): ";
-            } else {
-                break;
-            }
-        }
-        clearInputBuffer();
-        return (choice == 1) ? "PIN" : "Password";
+                  << SEP << '\n';
     }
 
 private:
@@ -331,12 +298,11 @@ private:
     std::string lastName_;
     std::string address_;
     int         accountNumber_{0};
-
     const std::string CSV_FILE_ = "userdata.csv";
 
     /**
-     * @brief  Reads the last account number stored in the CSV.
-     * @return Last account number found, or 1000 if the file is missing/empty.
+     * @brief  Reads the last account number from userdata.csv.
+     * @return Last account number found, or 1000 if file is absent/empty.
      */
     int readLastAccountNumber() const
     {
@@ -347,16 +313,15 @@ private:
         int lastNum = 1000;
 
         while (std::getline(file, line)) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
             std::istringstream ss(line);
             std::string cell;
             std::vector<std::string> row;
-
             while (std::getline(ss, cell, ','))
                 row.push_back(cell);
-
             if (!row.empty()) {
                 try { lastNum = std::stoi(row[0]); }
-                catch (...) { /* skip malformed rows */ }
+                catch (...) {}
             }
         }
         return lastNum;
@@ -371,24 +336,25 @@ private:
  * @class Card
  * @brief Represents an EMV payment card with encrypted field accessors.
  *
- * All sensitive getter methods encrypt their return value with the bank's
- * RSA public key before returning, ensuring raw data never leaves the object
- * in plaintext over an insecure channel.
+ * All sensitive getter methods RSA-encrypt their return value with the
+ * bank's public key before returning — raw data never crosses a class
+ * boundary in plaintext.
  *
- * Card numbers are validated against the Luhn algorithm and classified as
- * Visa or Mastercard/EuroCard on construction.
+ * Validated on construction:
+ *  - CVV range (100–999)
+ *  - Expiry date (not yet passed)
+ *  - PAN length and character set
+ *  - Luhn check digit
+ *  - Card network (Visa / Mastercard-EuroCard)
  */
 class Card
 {
 public:
-    /// Authentication methods supported by the card.
-    enum class AuthMethod { PIN, PASSWORD };
-
     /**
-     * @param cardNumber  16–19 digit PAN (Primary Account Number).
-     * @param cvv         3-digit card verification value.
-     * @param expDate     Expiry date string "MM/YY".
-     * @param currency    ISO 4217 currency code (e.g. "EUR").
+     * @param cardNumber  PAN (13–19 digits).
+     * @param cvv         3-digit CVV.
+     * @param expDate     "MM/YY" expiry string.
+     * @param currency    ISO 4217 currency code.
      * @param accountNb   Issuing bank account number.
      * @throws std::invalid_argument  on invalid CVV.
      * @throws std::runtime_error     if the card is expired.
@@ -406,9 +372,8 @@ public:
     }
 
     // --------------------------------------------------------
-    //  Encrypted getters (RSA-encrypted with bank public key)
+    //  RSA-encrypted getters
     // --------------------------------------------------------
-
     std::string getCardNumber() const { return encryptRSA(cardNumber_, BANK_PUBLIC_KEY); }
     std::string getAccountNb()  const { return encryptRSA(std::to_string(accountNb_), BANK_PUBLIC_KEY); }
     std::string getCVV()        const { return encryptRSA(std::to_string(cvv_), BANK_PUBLIC_KEY); }
@@ -417,9 +382,9 @@ public:
     std::string getBalance()    const { return encryptRSA(std::to_string(balance_), BANK_PUBLIC_KEY); }
 
     /**
-     * @brief  Validates the expiry date string and throws if the card is expired.
-     * @param  expDate  "MM/YY" formatted string.
-     * @throws std::runtime_error if the card has expired.
+     * @brief  Validates the expiry date and throws if the card has expired.
+     * @param  expDate  "MM/YY" string.
+     * @throws std::runtime_error if expired.
      */
     void validateExpirationDate(const std::string& expDate) const
     {
@@ -427,56 +392,40 @@ public:
         char delim = '/';
         std::istringstream ss(expDate);
         ss >> month >> delim >> year;
-
         if (isCardExpired(month, year))
             throw std::runtime_error("Card is expired.");
     }
 
 private:
-    // --------------------------------------------------------
-    //  Private data members
-    // --------------------------------------------------------
     const std::string cardNumber_;
     const int         cvv_;
     const std::string expDate_;
     std::string       currency_;
     double            balance_{0.0};
     const int         accountNb_;
-    std::string       authPass_;
-    AuthMethod        authMethod_{AuthMethod::PIN};
     std::string       cardType_;
 
     // --------------------------------------------------------
     //  Private helpers
     // --------------------------------------------------------
 
-    /**
-     * @brief  Returns a masked PAN — all digits except the last four replaced
-     *         with '*'. Example: "************1783".
-     */
+    /// Returns PAN with all but the last four digits masked.
     std::string getMaskedCardNumber() const
     {
         if (cardNumber_.size() < 4)
             return std::string(cardNumber_.size(), '*');
-
         return std::string(cardNumber_.size() - 4, '*') +
                cardNumber_.substr(cardNumber_.size() - 4);
     }
 
-    /// Populates @p month and @p year with the current local month/year (YY).
     void getCurrentMonthYear(int& month, int& year) const
     {
-        std::time_t t = std::time(nullptr);
+        std::time_t t   = std::time(nullptr);
         std::tm*    now = std::localtime(&t);
         month = now->tm_mon + 1;
         year  = now->tm_year % 100;
     }
 
-    /**
-     * @brief  Returns true if the card's expiry is on or before today.
-     * @param  expMonth  Expiry month (1–12).
-     * @param  expYear   Expiry year (last two digits, e.g. 26 for 2026).
-     */
     bool isCardExpired(int expMonth, int expYear) const
     {
         int curMonth = 0, curYear = 0;
@@ -485,10 +434,6 @@ private:
                (expYear == curYear && expMonth <= curMonth);
     }
 
-    /**
-     * @brief  Throws if the CVV is outside the valid 3-digit range (100–999).
-     * @throws std::invalid_argument on invalid CVV.
-     */
     void validateCVV(int cvv) const
     {
         if (cvv < 100 || cvv > 999)
@@ -496,12 +441,10 @@ private:
     }
 
     /**
-     * @brief  Validates the PAN using the Luhn algorithm.
+     * @brief  Validates the PAN with the Luhn algorithm.
      *
      * Iterates right-to-left, doubling every second digit and subtracting 9
-     * when the doubled value exceeds 9, then checks the total mod 10.
-     *
-     * @return true if the check digit is correct.
+     * when the result exceeds 9. Valid if the total is divisible by 10.
      */
     bool validateLuhn() const
     {
@@ -510,7 +453,7 @@ private:
             return false;
 
         int  sum       = 0;
-        bool alternate = false; // start from the rightmost digit
+        bool alternate = false;
 
         for (int i = static_cast<int>(cardNumber_.size()) - 1; i >= 0; --i) {
             int n = cardNumber_[i] - '0';
@@ -525,14 +468,14 @@ private:
     }
 
     /**
-     * @brief  Identifies the card network from the PAN prefix.
-     * @return Human-readable card type string, or "Invalid Card Type".
+     * @brief  Identifies the card network from PAN prefix and length.
+     * @return "Visa", "Mastercard / EuroCard", or "Unknown Card Type".
      */
     std::string determineCardType() const
     {
-        if (cardNumber_.empty()) return "Invalid Card Type";
+        if (cardNumber_.empty()) return "Unknown Card Type";
 
-        // Visa: starts with 4, length 13, 16, or 19
+        // Visa: starts with 4, length 13 / 16 / 19
         if (cardNumber_[0] == '4' &&
             (cardNumber_.size() == 13 ||
              cardNumber_.size() == 16 ||
@@ -542,35 +485,23 @@ private:
         if (cardNumber_.size() == 16) {
             int first2 = std::stoi(cardNumber_.substr(0, 2));
             int first4 = std::stoi(cardNumber_.substr(0, 4));
-
-            // Mastercard: 51–55 or 2221–2720
+            // Mastercard: prefix 51–55 or 2221–2720
             if ((first2 >= 51 && first2 <= 55) ||
                 (first4 >= 2221 && first4 <= 2720))
                 return "Mastercard / EuroCard";
         }
 
-        return "Invalid Card Type";
+        return "Unknown Card Type";
     }
 
-    /// Runs length/character/Luhn checks and prints the result.
+    /// Runs all structural checks and prints the result.
     void validateAndPrintCardNumber() const
     {
-        if (cardNumber_.empty()) {
-            std::cout << "Card number is empty.\n";
-            return;
-        }
-        if (cardNumber_.size() < 13) {
-            std::cout << "Card number is too short.\n";
-            return;
-        }
-        if (cardNumber_.size() > 19) {
-            std::cout << "Card number is too long.\n";
-            return;
-        }
-        if (!std::all_of(cardNumber_.begin(), cardNumber_.end(), ::isdigit)) {
-            std::cout << "Card number contains non-digit characters.\n";
-            return;
-        }
+        if (cardNumber_.empty())          { std::cout << "Card number is empty.\n";                          return; }
+        if (cardNumber_.size() < 13)      { std::cout << "Card number is too short.\n";                      return; }
+        if (cardNumber_.size() > 19)      { std::cout << "Card number is too long.\n";                       return; }
+        if (!std::all_of(cardNumber_.begin(), cardNumber_.end(), ::isdigit))
+                                          { std::cout << "Card number contains non-digit characters.\n";     return; }
 
         if (validateLuhn()) {
             std::cout << "Card " << getMaskedCardNumber()
@@ -582,6 +513,117 @@ private:
 };
 
 // ============================================================
+//  Class: CurrencyConverter
+// ============================================================
+
+/**
+ * @class CurrencyConverter
+ * @brief Provides real-time-style currency conversion for payment processing.
+ *
+ * Rates are expressed as units-per-1-USD and stored in a flat map.
+ * All conversions go through USD as the intermediate pivot currency,
+ * so any supported currency pair can be converted without a direct
+ * rate entry.
+ *
+ * In production this class would fetch live rates from an exchange-rate
+ * API (e.g. exchangerate-api.com) on construction and cache them for
+ * the session.  The fetch point is clearly marked below.
+ *
+ * Supported currencies: USD, EUR, AUD, GBP, JPY, CAD, CHF, CNY, INR, SGD.
+ */
+class CurrencyConverter
+{
+public:
+    CurrencyConverter()
+    {
+        // ----------------------------------------------------------------
+        // PRODUCTION HOOK: replace this block with an HTTP GET to
+        //   https://api.exchangerate-api.com/v4/latest/USD
+        // and parse the returned JSON into rates_.
+        // ----------------------------------------------------------------
+        rates_ = {
+            {"USD", 1.0000},
+            {"EUR", 0.9200},
+            {"AUD", 1.5300},
+            {"GBP", 0.7900},
+            {"JPY", 149.50},
+            {"CAD", 1.3600},
+            {"CHF", 0.8950},
+            {"CNY", 7.2400},
+            {"INR", 83.200},
+            {"SGD", 1.3400},
+        };
+    }
+
+    /**
+     * @brief  Converts an amount from one currency to another.
+     *
+     * Uses USD as the pivot: amount → USD → target.
+     *
+     * @param  amount    Value to convert.
+     * @param  fromCurr  ISO 4217 source currency code.
+     * @param  toCurr    ISO 4217 target currency code.
+     * @return Converted amount, rounded to 2 decimal places.
+     * @throws std::invalid_argument if either currency code is unsupported.
+     */
+    double convert(double amount,
+                   const std::string& fromCurr,
+                   const std::string& toCurr) const
+    {
+        if (fromCurr == toCurr) return amount;
+
+        auto itFrom = rates_.find(fromCurr);
+        auto itTo   = rates_.find(toCurr);
+
+        if (itFrom == rates_.end())
+            throw std::invalid_argument("Unsupported currency: " + fromCurr);
+        if (itTo == rates_.end())
+            throw std::invalid_argument("Unsupported currency: " + toCurr);
+
+        // Pivot through USD
+        double inUSD = amount / itFrom->second;
+        double result = inUSD * itTo->second;
+
+        // Round to 2 decimal places
+        return std::round(result * 100.0) / 100.0;
+    }
+
+    /**
+     * @brief  Returns the exchange rate between two currencies.
+     * @param  fromCurr  Source currency.
+     * @param  toCurr    Target currency.
+     * @return Rate such that 1 fromCurr = rate toCurr.
+     */
+    double rate(const std::string& fromCurr, const std::string& toCurr) const
+    {
+        return convert(1.0, fromCurr, toCurr);
+    }
+
+    /// Returns true if @p currCode is in the supported rate table.
+    bool isSupported(const std::string& currCode) const
+    {
+        return rates_.find(currCode) != rates_.end();
+    }
+
+    /// Prints the full rate table to stdout (all rates relative to USD).
+    void printRates() const
+    {
+        std::cout << SEP << '\n'
+                  << "  EXCHANGE RATES (base: USD)\n"
+                  << SEP << '\n';
+        for (const auto& [code, rate] : rates_) {
+            std::cout << "  1 USD = "
+                      << std::fixed << std::setprecision(4)
+                      << rate << ' ' << code << '\n';
+        }
+        std::cout << SEP << '\n';
+    }
+
+private:
+    std::map<std::string, double> rates_;
+};
+
+// ============================================================
 //  Class: Bank
 // ============================================================
 
@@ -590,13 +632,15 @@ private:
  * @brief Simulates the card-issuing bank's back-end.
  *
  * Responsibilities:
- *  - Generates and holds the RSA-2048 key pair.
+ *  - Holds a 2048-bit RSA key pair (private key never leaves the class).
  *  - Maintains an in-memory AES-256-CBC encrypted card database (encDB_).
- *  - Validates card details, authenticates cardholders, and updates balances.
+ *  - Looks up cards by PAN, verifies all fields, and authenticates cardholders.
+ *  - Supports card lookup directly by raw PAN string (used by the terminal
+ *    when the operator enters a card number at the point of sale).
  *
- * @note encDB_ is populated from "credit_card.csv" on construction.
- *       CSV columns (in order): card_no, acc_no, cvv, exp_date, currency,
- *       auth_method, auth_credential, balance.
+ * @note CSV column order: CardNumber, AccountNumber, CVV, ExpDate, Currency,
+ *       AuthMeth (PIN|PASS), AuthPass, Balance.
+ *       The first row is treated as a header and skipped automatically.
  */
 class Bank
 {
@@ -628,20 +672,48 @@ public:
     }
 
     // --------------------------------------------------------
-    //  Public key / IV accessors
+    //  Public key accessor
     // --------------------------------------------------------
-
-    CryptoPP::RSA::PublicKey   getPublicKey() const { return publicKey_; }
-    CryptoPP::SecByteBlock     getIV()        const { return iv_; }
+    CryptoPP::RSA::PublicKey getPublicKey() const { return publicKey_; }
 
     // --------------------------------------------------------
-    //  Card operations
+    //  Card lookup by raw PAN (used by Terminal::promptAndLoadCard)
     // --------------------------------------------------------
 
     /**
-     * @brief  Checks whether all card fields match a record in the encrypted DB.
-     * @param  card  Card object whose encrypted getters will be queried.
-     * @return true if a matching, non-expired record is found.
+     * @brief  Looks up a card record by its plaintext PAN.
+     *
+     * Called by the Terminal after the operator types a card number.
+     * Returns a fully-constructed Card object if the PAN exists in the DB,
+     * throws otherwise.
+     *
+     * @param  pan  Plaintext card number entered by the operator.
+     * @return Card object populated from the matched DB record.
+     * @throws std::runtime_error if no matching record is found.
+     */
+    Card lookupCardByPAN(const std::string& pan)
+    {
+        for (const CardRecord& rec : encDB_) {
+            if (decryptAES(rec.cardNo, secretKey_, iv_) == pan) {
+                int         accNo    = std::stoi(decryptAES(rec.accNo,   secretKey_, iv_));
+                int         cvv      = std::stoi(decryptAES(rec.cvv,     secretKey_, iv_));
+                std::string expDate  = decryptAES(rec.expDate,  secretKey_, iv_);
+                std::string currency = decryptAES(rec.currency, secretKey_, iv_);
+                // Card constructor runs Luhn + expiry validation
+                return Card(pan, cvv, expDate, currency, accNo);
+            }
+        }
+        throw std::runtime_error("Card not found in database.");
+    }
+
+    // --------------------------------------------------------
+    //  Card verification
+    // --------------------------------------------------------
+
+    /**
+     * @brief  Verifies all card fields against the encrypted DB.
+     * @param  card  Card whose encrypted getters will be queried.
+     * @return true if a fully-matching, non-expired record is found.
      */
     bool checkCardDetail(const Card& card)
     {
@@ -666,14 +738,20 @@ public:
         return false;
     }
 
+    // --------------------------------------------------------
+    //  Authentication
+    // --------------------------------------------------------
+
     /**
-     * @brief  Authenticates the cardholder against the stored credential.
+     * @brief  Authenticates the cardholder for the given card.
      *
-     * Locates the card record, determines whether the stored method is PIN or
-     * PASS, then delegates to authenticate() for up to MAX_ATTEMPTS tries.
+     * Locates the matching DB record, decrypts the auth method and stored
+     * credential, then runs the interactive authenticate() loop.
+     * Authentication is always required, regardless of transaction type
+     * (Contactless or Contact).
      *
-     * @param  card  The card being authenticated.
-     * @return true on successful authentication.
+     * @param  card  The card being presented.
+     * @return true on successful authentication within MAX_ATTEMPTS.
      */
     bool cardAuthentication(Card& card)
     {
@@ -686,59 +764,100 @@ public:
                 return authenticate(method, credential);
             }
         }
+        std::cerr << "Error: card not found during authentication.\n";
         return false;
     }
 
+    // --------------------------------------------------------
+    //  Payment processing
+    // --------------------------------------------------------
+
     /**
-     * @brief  Deducts @p cost from the card's stored balance.
+     * @brief  Processes a payment, converting currencies if necessary.
      *
-     * Prints the current balance, deducts if funds are sufficient, and
-     * updates the in-memory encrypted record.
+     * If the merchant currency differs from the card's currency, the
+     * merchant amount is converted to the card's currency before debiting.
+     * The cardholder always sees both the merchant amount and the exact
+     * amount debited from their card.
      *
-     * @param  card  Card to debit.
-     * @param  cost  Amount to deduct (in the card's currency).
+     * @param  card            Card to debit.
+     * @param  merchantAmount  Amount in the merchant's currency.
+     * @param  merchantCurr    ISO 4217 merchant currency code.
+     * @param  converter       CurrencyConverter instance for rate lookup.
+     * @return true if payment succeeded, false if declined.
      */
-    void processPayment(Card& card, double cost)
+    bool processPayment(Card& card, double merchantAmount,
+                        const std::string& merchantCurr,
+                        const CurrencyConverter& converter)
     {
         const std::string cardNo = decryptRSA(card.getCardNumber(), privateKey_);
 
         for (CardRecord& rec : encDB_) {
             if (decryptAES(rec.cardNo, secretKey_, iv_) == cardNo) {
                 double      balance  = std::stod(decryptAES(rec.balance,  secretKey_, iv_));
-                std::string currency = decryptAES(rec.currency, secretKey_, iv_);
+                std::string cardCurr = decryptAES(rec.currency, secretKey_, iv_);
+
+                // Convert merchant amount → card currency
+                double chargeAmount = converter.convert(merchantAmount, merchantCurr, cardCurr);
+
+                // Show conversion breakdown if currencies differ
+                if (merchantCurr != cardCurr) {
+                    double rate = converter.rate(merchantCurr, cardCurr);
+                    std::cout << SEP << '\n'
+                              << "  CURRENCY CONVERSION\n"
+                              << SEP << '\n'
+                              << "  Merchant amount : "
+                              << std::fixed << std::setprecision(2)
+                              << merchantAmount << ' ' << merchantCurr << '\n'
+                              << "  Exchange rate   : 1 " << merchantCurr
+                              << " = " << std::fixed << std::setprecision(4)
+                              << rate << ' ' << cardCurr << '\n'
+                              << "  Charge to card  : "
+                              << std::fixed << std::setprecision(2)
+                              << chargeAmount << ' ' << cardCurr << '\n'
+                              << SEP << '\n';
+                }
 
                 std::cout << "Current balance: "
                           << std::fixed << std::setprecision(2)
-                          << balance << ' ' << currency << '\n';
+                          << balance << ' ' << cardCurr << '\n';
 
-                if (balance >= cost) {
-                    balance    -= cost;
+                if (balance >= chargeAmount) {
+                    balance    -= chargeAmount;
                     rec.balance = encryptAES(std::to_string(balance), secretKey_, iv_);
 
-                    std::cout << "Payment successful. "
+                    std::cout << "Payment successful.\n"
+                              << "  Debited : "
                               << std::fixed << std::setprecision(2)
-                              << cost << ' ' << currency << " debited.\n"
-                              << "New balance: "
+                              << chargeAmount << ' ' << cardCurr << '\n'
+                              << "  Balance : "
                               << std::fixed << std::setprecision(2)
-                              << balance << ' ' << currency << '\n';
+                              << balance << ' ' << cardCurr << '\n';
+                    return true;
                 } else {
-                    std::cout << "Payment declined: insufficient funds.\n";
+                    std::cout << "Payment declined: insufficient funds.\n"
+                              << "  Required: "
+                              << std::fixed << std::setprecision(2)
+                              << chargeAmount << ' ' << cardCurr
+                              << "  |  Available: "
+                              << std::fixed << std::setprecision(2)
+                              << balance << ' ' << cardCurr << '\n';
+                    return false;
                 }
-                return;
             }
         }
-        std::cerr << "Error: card not found in database.\n";
+        std::cerr << "Error: card not found during payment.\n";
+        return false;
     }
 
     /**
-     * @brief  Returns the ISO currency string for the given card.
+     * @brief  Returns the ISO currency code for the given card.
      * @param  card  Card whose currency to look up.
      * @return Currency string (e.g. "EUR"), or "AUD" if not found.
      */
     std::string getCurrency(Card& card)
     {
         const std::string cardNo = decryptRSA(card.getCardNumber(), privateKey_);
-
         for (const CardRecord& rec : encDB_) {
             if (decryptAES(rec.cardNo, secretKey_, iv_) == cardNo)
                 return decryptAES(rec.currency, secretKey_, iv_);
@@ -746,32 +865,31 @@ public:
         return "AUD";
     }
 
-    /// Prints Base64-DER-encoded public and private keys to stdout.
+    /// Prints Base64-DER-encoded RSA public and private keys to stdout.
     void printKeys()
     {
         std::cout << "Public Key (Base64 DER):\n"
                   << encodeKeyToBase64(publicKey_)  << '\n'
-                  << SEPARATOR << '\n'
+                  << SEP << '\n'
                   << "Private Key (Base64 DER):\n"
                   << encodeKeyToBase64(privateKey_) << '\n';
     }
 
 private:
     // --------------------------------------------------------
-    //  Private data members
+    //  Private members
     // --------------------------------------------------------
     CryptoPP::RSA::PublicKey  publicKey_;
     CryptoPP::RSA::PrivateKey privateKey_;
     CryptoPP::SecByteBlock    secretKey_{generateAESKey(AES_256_KEY_SIZE)};
     CryptoPP::SecByteBlock    iv_{generateAESIV()};
-
-    std::vector<CardRecord> encDB_;
+    std::vector<CardRecord>   encDB_;
 
     // --------------------------------------------------------
     //  Private helpers
     // --------------------------------------------------------
 
-    /// Generates a fresh 2048-bit RSA key pair for this bank instance.
+    /// Generates a fresh 2048-bit RSA key pair.
     void generateBankRSAKeys()
     {
         CryptoPP::AutoSeededRandomPool rng;
@@ -780,13 +898,9 @@ private:
     }
 
     /**
-     * @brief  Reads credit_card.csv, AES-encrypts every field, and stores the
-     *         records in encDB_.
-     *
-     * Expected CSV column order:
-     *   card_no, acc_no, cvv, exp_date, currency, auth_method, auth_credential, balance
-     *
-     * @param filename  Path to the plain-text card database CSV.
+     * @brief  Reads credit_card.csv, AES-encrypts every field, and stores
+     *         records in encDB_.  The first row (header) is skipped.
+     * @param  filename  Path to the plain-text card database CSV.
      */
     void loadEncryptedCardDB(const std::string& filename)
     {
@@ -801,16 +915,13 @@ private:
         bool firstRow = true;
 
         while (std::getline(file, line)) {
-            // Strip Windows-style CR if present
-            if (!line.empty() && line.back() == '\r')
-                line.pop_back();
-
+            if (!line.empty() && line.back() == '\r') line.pop_back();
             if (line.empty()) continue;
 
-            // Skip the header row (CardNumber,AccountNumber,...)
+            // Skip header — any row whose first character is not a digit
             if (firstRow) {
                 firstRow = false;
-                if (!line.empty() && !::isdigit(static_cast<unsigned char>(line[0])))
+                if (!::isdigit(static_cast<unsigned char>(line[0])))
                     continue;
             }
 
@@ -819,13 +930,12 @@ private:
             std::string cell;
 
             while (std::getline(ss, cell, ',')) {
-                // Trim leading/trailing whitespace from each cell
-                auto start = cell.find_first_not_of(" \t");
-                auto end   = cell.find_last_not_of(" \t");
-                cols.push_back((start == std::string::npos) ? "" : cell.substr(start, end - start + 1));
+                auto s = cell.find_first_not_of(" \t");
+                auto e = cell.find_last_not_of(" \t");
+                cols.push_back((s == std::string::npos) ? "" : cell.substr(s, e - s + 1));
             }
 
-            if (cols.size() < 8) continue; // skip malformed rows
+            if (cols.size() < 8) continue;
 
             CardRecord rec;
             rec.cardNo         = encryptAES(cols[0], secretKey_, iv_);
@@ -836,20 +946,22 @@ private:
             rec.authMethod     = encryptAES(cols[5], secretKey_, iv_);
             rec.authCredential = encryptAES(cols[6], secretKey_, iv_);
             rec.balance        = encryptAES(cols[7], secretKey_, iv_);
-
             encDB_.push_back(rec);
         }
+
+        std::cout << "Bank: loaded " << encDB_.size()
+                  << " card record(s) from '" << filename << "'.\n";
     }
 
     /**
-     * @brief  Handles the interactive authentication loop (up to MAX_ATTEMPTS).
+     * @brief  Interactive authentication loop (up to MAX_ATTEMPTS tries).
      *
-     * Compares the SHA-384 hash of the user's input against the stored
-     * credential hash to avoid any timing-observable plaintext comparison.
+     * Compares SHA-384 hashes of the entered credential against the stored
+     * hash to avoid timing-observable plaintext comparisons.
      *
-     * @param  authMethod   "PIN" or "PASS".
-     * @param  storedCred   Plaintext credential from the decrypted DB record.
-     * @return true if the user authenticates within the allowed attempts.
+     * @param  authMethod  "PIN" or "PASS".
+     * @param  storedCred  Plaintext credential from the decrypted DB record.
+     * @return true on success.
      */
     bool authenticate(const std::string& authMethod,
                       const std::string& storedCred)
@@ -862,33 +974,26 @@ private:
             ++attempts;
 
             std::string input;
-            if (authMethod == "PIN") {
-                std::cout << "Enter your PIN: ";
-            } else {
-                std::cout << "Enter your Password: ";
-            }
+            std::cout << ((authMethod == "PIN") ? "Enter your PIN: "
+                                                : "Enter your Password: ");
             std::cin >> input;
-            std::cout << SEPARATOR << '\n';
+            clearInputBuffer();
+            std::cout << SEP << '\n';
 
             if (hashSHA384(input) == storedHash) {
                 success = true;
             } else if (attempts < MAX_ATTEMPTS) {
                 std::cout << "Incorrect. "
                           << (MAX_ATTEMPTS - attempts)
-                          << " attempt(s) remaining.\n"
-                          << SEPARATOR << '\n';
+                          << " attempt(s) remaining.\n" << SEP << '\n';
             } else {
-                std::cout << "Authentication failed after "
-                          << MAX_ATTEMPTS << " attempts. Payment declined.\n";
+                std::cout << "Authentication failed after " << MAX_ATTEMPTS
+                          << " attempts. Payment declined.\n";
             }
         }
         return success;
     }
 
-    /**
-     * @brief  DER-encodes an RSA public key and returns it as a Base64 string.
-     * @param  key  RSA public key.
-     */
     std::string encodeKeyToBase64(const CryptoPP::RSA::PublicKey& key) const
     {
         std::string encoded;
@@ -898,10 +1003,6 @@ private:
         return encoded;
     }
 
-    /**
-     * @brief  DER-encodes an RSA private key and returns it as a Base64 string.
-     * @param  key  RSA private key.
-     */
     std::string encodeKeyToBase64(const CryptoPP::RSA::PrivateKey& key) const
     {
         std::string encoded;
@@ -920,8 +1021,14 @@ private:
  * @class Terminal
  * @brief Represents a point-of-sale (POS) terminal.
  *
- * Manages the transaction log, delegates card authentication to the bank,
- * and records the transaction type (Contactless / Contact).
+ * The terminal drives the full payment flow:
+ *  1. Prompts the operator to type the customer's card number.
+ *  2. Asks the bank to look up and return a Card object.
+ *  3. Verifies the card details with the bank.
+ *  4. Lets the customer choose Contactless or Contact.
+ *  5. Challenges the customer for their PIN / password (always required).
+ *  6. Processes the payment through the bank.
+ *  7. Logs the transaction to the internal list.
  */
 class Terminal
 {
@@ -929,32 +1036,70 @@ public:
     Terminal() = default;
 
     /**
-     * @brief  Asks the bank to authenticate the cardholder.
-     * @param  bank  Bank that issued the card.
-     * @param  card  Card being presented at the terminal.
+     * @brief  Runs a complete end-to-end payment transaction.
+     *
+     * Prompts for the card number, validates, selects transaction type,
+     * authenticates (PIN/password always required), converts currency if
+     * needed, and processes payment.
+     *
+     * @param  bank            Bank that issued the card.
+     * @param  converter       CurrencyConverter for FX rate lookup.
+     * @param  amount          Amount to charge in the merchant's currency.
+     * @param  merchantCurr    ISO 4217 currency the merchant charges in.
+     * @param  merchant        Description of the merchant / purchase location.
      */
-    void validateAuthentication(Bank& bank, Card& card)
+    void runTransaction(Bank& bank, const CurrencyConverter& converter,
+                        double amount, const std::string& merchantCurr,
+                        const std::string& merchant)
     {
-        if (bank.cardAuthentication(card)) {
-            std::cout << "Authentication successful. Proceeding with payment.\n";
-        } else {
-            std::cout << "Authentication failed.\n";
-        }
-    }
+        std::cout << '\n' << SEP << '\n'
+                  << "  NEW TRANSACTION\n"
+                  << SEP << '\n';
 
-    /**
-     * @brief  Records a new transaction with a freshly generated TUN.
-     * @param  currency  ISO currency code.
-     * @param  location  Merchant / transaction description.
-     * @param  date      Formatted date-time string (from getCurrentDateTime()).
-     */
-    void addTransaction(const std::string& currency,
-                        const std::string& location,
-                        const std::string& date)
-    {
-        long long tun  = generateTUN();
-        std::string type = selectTransactionType();
-        transactions_.emplace_back(tun, currency, location, type, date);
+        // Step 1 — Card number entry
+        Card card = promptAndLoadCard(bank);
+
+        // Step 2 — Verify card against bank DB
+        std::cout << SEP << '\n';
+        if (!bank.checkCardDetail(card)) {
+            std::cout << "Card details are invalid or not found. Transaction aborted.\n";
+            return;
+        }
+        std::cout << "Card details verified.\n" << SEP << '\n';
+
+        // Step 3 — Transaction type (Contactless / Contact)
+        std::string txType = selectTransactionType();
+        std::cout << SEP << '\n';
+
+        // Step 4 — Authentication (PIN or password, always required)
+        std::cout << "Authentication required for "
+                  << txType << " transaction.\n" << SEP << '\n';
+        if (!bank.cardAuthentication(card)) {
+            std::cout << "Transaction aborted due to failed authentication.\n";
+            return;
+        }
+        std::cout << "Authentication successful. Proceeding with payment.\n"
+                  << SEP << '\n';
+
+        // Step 5 — Payment (with automatic currency conversion)
+        if (!bank.processPayment(card, amount, merchantCurr, converter)) {
+            return; // declined — no log entry, no keys
+        }
+
+        // Step 6 — Log (only reached on successful payment)
+        std::string cardCurr = bank.getCurrency(card);
+        std::string txDate   = getCurrentDateTime();
+        long long   tun      = generateTUN();
+        // Store merchant amount/currency for the receipt
+        transactions_.emplace_back(tun, merchantCurr, cardCurr, merchant, txType, txDate, amount);
+
+        std::cout << SEP << '\n'
+                  << "  Transaction complete.\n"
+                  << "  TUN: " << tun << '\n'
+                  << SEP << '\n';
+
+        // Keys are shown only on successful payment completion.
+        bank.printKeys();
     }
 
     /// Prints all recorded transactions to stdout.
@@ -964,16 +1109,22 @@ public:
             std::cout << "No transactions recorded.\n";
             return;
         }
-
+        std::cout << '\n' << SEP << '\n'
+                  << "  TRANSACTION LOG\n" << SEP << '\n';
         for (const Transaction& tx : transactions_) {
-            std::cout << SEPARATOR << '\n'
-                      << "  TUN:      " << tx.tun      << '\n'
-                      << "  Currency: " << tx.currency  << '\n'
-                      << "  Location: " << tx.location  << '\n'
-                      << "  Type:     " << tx.type      << '\n'
-                      << "  Date:     " << tx.date      << '\n';
+            std::cout << "  TUN:      " << tx.tun      << '\n'
+                      << "  Merchant: " << tx.merchant << '\n'
+                      << "  Amount:   "
+                      << std::fixed << std::setprecision(2)
+                      << tx.merchantAmount << ' ' << tx.merchantCurr;
+            if (tx.merchantCurr != tx.cardCurr) {
+                std::cout << "  (charged in " << tx.cardCurr << ")";
+            }
+            std::cout << '\n'
+                      << "  Type:     " << tx.type << '\n'
+                      << "  Date:     " << tx.date << '\n'
+                      << SEP << '\n';
         }
-        std::cout << SEPARATOR << '\n';
     }
 
 private:
@@ -982,15 +1133,18 @@ private:
     // --------------------------------------------------------
     struct Transaction {
         long long   tun;
-        std::string currency;
-        std::string location;
+        std::string merchantCurr; ///< Currency the merchant charged in
+        std::string cardCurr;     ///< Currency debited from the card
+        std::string merchant;
         std::string type;
         std::string date;
+        double      merchantAmount; ///< Amount in merchant currency
 
-        Transaction(long long t, std::string c, std::string l,
-                    std::string tp, std::string d)
-            : tun(t), currency(std::move(c)), location(std::move(l)),
-              type(std::move(tp)), date(std::move(d)) {}
+        Transaction(long long t, std::string mc, std::string cc,
+                    std::string m, std::string tp, std::string d, double a)
+            : tun(t), merchantCurr(std::move(mc)), cardCurr(std::move(cc)),
+              merchant(std::move(m)), type(std::move(tp)), date(std::move(d)),
+              merchantAmount(a) {}
     };
 
     std::list<Transaction> transactions_;
@@ -999,26 +1153,52 @@ private:
     //  Private helpers
     // --------------------------------------------------------
 
-    /// Generates a cryptographically seeded random 16-digit TUN.
-    long long generateTUN() const
+    /**
+     * @brief  Prompts the operator to enter a card number, validates its
+     *         basic format (digits only, 13–19 chars), then asks the bank
+     *         to look up the full card record.
+     *
+     * Retries indefinitely on invalid format; throws if the bank cannot
+     * find the PAN in its database.
+     *
+     * @param  bank  Bank to query for the card record.
+     * @return Fully-constructed and validated Card object.
+     */
+    Card promptAndLoadCard(Bank& bank) const
     {
-        std::random_device rd;
-        std::mt19937_64    gen(rd());
-        std::uniform_int_distribution<long long> dist(
-            1'000'000'000'000'000LL,
-            9'999'999'999'999'999LL);
-        return dist(gen);
+        while (true) {
+            std::string pan;
+            std::cout << "Enter card number: ";
+            std::cin >> pan;
+            clearInputBuffer();
+
+            // Basic format check before hitting the DB
+            if (pan.size() < 13 || pan.size() > 19 ||
+                !std::all_of(pan.begin(), pan.end(), ::isdigit))
+            {
+                std::cout << "Invalid card number format. "
+                             "Must be 13–19 digits. Try again.\n";
+                continue;
+            }
+
+            try {
+                Card card = bank.lookupCardByPAN(pan);
+                return card;
+            } catch (const std::exception& ex) {
+                std::cout << "Error: " << ex.what()
+                          << " Please check the number and try again.\n";
+            }
+        }
     }
 
     /**
-     * @brief  Prompts the user to select Contactless or Contact payment.
+     * @brief  Prompts for transaction type selection.
      * @return "Contactless" or "Contact".
      */
-    std::string selectTransactionType()
+    std::string selectTransactionType() const
     {
         int choice = 0;
-        std::cout << "Select transaction type: 1) Contactless  2) Contact: ";
-
+        std::cout << "Transaction type: 1) Contactless  2) Contact: ";
         while (true) {
             std::cin >> choice;
             if (std::cin.fail() || (choice != 1 && choice != 2)) {
@@ -1031,6 +1211,17 @@ private:
         clearInputBuffer();
         return (choice == 1) ? "Contactless" : "Contact";
     }
+
+    /// Generates a cryptographically seeded random 16-digit TUN.
+    long long generateTUN() const
+    {
+        std::random_device rd;
+        std::mt19937_64    gen(rd());
+        std::uniform_int_distribution<long long> dist(
+            1'000'000'000'000'000LL,
+            9'999'999'999'999'999LL);
+        return dist(gen);
+    }
 };
 
 // ============================================================
@@ -1038,49 +1229,93 @@ private:
 // ============================================================
 
 /**
- * @brief  Drives a single end-to-end EMV payment flow:
- *         card validation → transaction selection → authentication → payment.
+ * @brief  Drives a structured EMV demonstration session.
+ *
+ * The demo is split into three acts:
+ *
+ *  ACT 1 — Valid transactions
+ *    Two successful payments using different auth methods (PASS and PIN).
+ *
+ *  ACT 2 — Invalid card detection
+ *    The terminal is fed four bad card numbers in sequence, each triggering
+ *    a different validation error:
+ *      a) Too short   (11 digits)
+ *      b) Non-digit   (contains letter 'O')
+ *      c) Bad Luhn    (valid-looking 16-digit number with wrong check digit)
+ *      d) Not in DB   (correct format and Luhn, but unknown to the bank)
+ *    After each bad card the terminal loops back and asks again, so
+ *    ACT 2 feeds all four bad numbers then a valid one to exit cleanly.
+ *
+ *  ACT 3 — Wrong PIN lockout
+ *    A valid card is presented but the cardholder enters the wrong PIN
+ *    three times, triggering the MAX_ATTEMPTS lockout.
  */
 int main()
 {
     try {
-        // -- Instantiate the three core actors --------------------------------
-        Terminal terminal;
-        Bank     bank;
-        UserData user("Bob", "Star", "11 Park Avenue, Switzerland");
+        Terminal         terminal;
+        Bank             bank;
+        CurrencyConverter converter;
+        UserData         user("Bob", "Star", "11 Park Avenue, Switzerland");
 
-        // -- Present a card at the terminal -----------------------------------
-        //    Card(PAN, CVV, "MM/YY", currency, accountNumber)
-        //    Matches CSV row 3: auth method PASS, credential "password123"
-        Card validCard("4716893064521783", 234, "11/26", "EUR", 12345679);
+        // Print exchange rate table at session start
+        converter.printRates();
 
-        // -- Verify card details against the bank's encrypted DB --------------
-        std::cout << SEPARATOR << '\n';
-        if (!bank.checkCardDetail(validCard)) {
-            std::cout << "Card details are invalid or not found. Aborting.\n";
-            return 1;
-        }
-        std::cout << "Card details verified.\n" << SEPARATOR << '\n';
+        // ================================================================
+        //  Reference sheet printed at startup
+        // ================================================================
+        std::cout << '\n' << SEP << '\n'
+                  << "  EMV PAYMENT TERMINAL — DEMO\n"
+                  << SEP << '\n'
+                  << "  VALID CARDS\n"
+                  << "    Card A  (PASS): 4338908386379407  pw: password123   bal: 2345.67 EUR\n"
+                  << "    Card B  (PIN):  4104332181960018  PIN: 1234          bal: 5467.23 USD\n"
+                  << "    Card C  (PIN):  5300524278680116  PIN: 1278          bal: 5420.00 USD\n"
+                  << '\n'
+                  << "  INVALID CARDS (for demonstration)\n"
+                  << "    Too short:   41043321819\n"
+                  << "    Non-digit:   4104332181960O18\n"
+                  << "    Bad Luhn:    4104332181960011\n"
+                  << "    Not in DB:   4012888888881881\n"
+                  << '\n'
+                  << "  NOTE: Terminal charges in AUD. Cards in EUR/USD will show FX conversion.\n"
+                  << SEP << '\n';
 
-        // -- Log the transaction ----------------------------------------------
-        std::string txDate = getCurrentDateTime();
-        std::cout << "Select your payment method:\n" << SEPARATOR << '\n';
-        terminal.addTransaction(bank.getCurrency(validCard), "Store Purchase", txDate);
+        // ================================================================
+        //  ACT 1 — Two successful transactions
+        // ================================================================
+        std::cout << "\n>>> ACT 1: Valid transactions\n";
 
-        // -- Authenticate and process payment ---------------------------------
-        std::cout << SEPARATOR << '\n';
-        terminal.validateAuthentication(bank, validCard);
-        bank.processPayment(validCard, 234.50);
+        // Transaction 1a — PASS auth
+        std::cout << "\n[Enter card: 4338908386379407  then password: password123]\n";
+        terminal.runTransaction(bank, converter, 49.99, "AUD", "Coffee Shop");
 
-        // -- Receipt ----------------------------------------------------------
-        std::cout << SEPARATOR << '\n';
+        // Transaction 1b — PIN auth
+        std::cout << "\n[Enter card: 4104332181960018  then PIN: 1234]\n";
+        terminal.runTransaction(bank, converter, 120.00, "AUD", "Supermarket");
+
+        // ================================================================
+        //  ACT 2 — Invalid card detection
+        //  The terminal loops on bad input, so we feed four bad numbers
+        //  followed by a valid one to let the transaction complete.
+        // ================================================================
+        std::cout << "\n>>> ACT 2: Invalid card detection\n"
+                  << "[Enter in order: 41043321819 → 4104332181960O18 → "
+                     "4104332181960011 → 4012888888881881 → 5300524278680116  PIN: 1278]\n";
+        terminal.runTransaction(bank, converter, 25.00, "AUD", "Pharmacy");
+
+        // ================================================================
+        //  ACT 3 — Wrong PIN lockout (3 wrong attempts)
+        // ================================================================
+        std::cout << "\n>>> ACT 3: Wrong PIN lockout\n"
+                  << "[Enter card: 4104332181960018  then PIN: 0000 three times]\n";
+        terminal.runTransaction(bank, converter, 50.00, "AUD", "Electronics Store");
+
+        // ================================================================
+        //  Receipt — only shown if at least one transaction succeeded
+        // ================================================================
         terminal.displayTransactions();
-        std::cout << SEPARATOR << '\n';
 
-        // -- Bank key display (for demonstration only) ------------------------
-        std::cout << "Bank RSA Keys (demonstration):\n" << SEPARATOR << '\n';
-        bank.printKeys();
-        std::cout << SEPARATOR << '\n';
 
     } catch (const std::exception& ex) {
         std::cerr << "Fatal error: " << ex.what() << '\n';
