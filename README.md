@@ -41,9 +41,9 @@ Authentication behaviour depends on transaction type and amount. The contactless
 
 | Transaction Type | Amount (AUD equivalent) | Authentication |
 |---|---|---|
-| Contact | Any | ✅ Always required |
-| Contactless | ≤ 100 AUD | ❌ Not required |
-| Contactless | > 100 AUD | ✅ Required |
+| Contact | Any |  Always required |
+| Contactless | ≤ 100 AUD |  Not required |
+| Contactless | > 100 AUD |  Required |
 
 When authentication is required, the cardholder has **3 attempts** before the transaction is locked out and declined.
 
@@ -100,11 +100,11 @@ The built-in demo runs five transactions covering every code path:
 
 | Act | Type | Amount | Card currency | Auth triggered | Expected outcome |
 |---|---|---|---|---|---|
-| 1a | Contactless | 49.99 AUD | EUR | ❌ No (under limit) | Payment + FX conversion |
-| 1b | Contactless | 150.00 AUD | USD | ✅ Yes (over limit) | PIN → payment + FX conversion |
-| 1c | Contact | 25.00 AUD | USD | ✅ Yes (always) | PIN → payment + FX conversion |
-| 2  | Contactless | 20.00 AUD | EUR | ❌ No (under limit) | 4 bad cards rejected, 5th succeeds |
-| 3  | Contactless | 150.00 AUD | USD | ✅ Yes (over limit) | 3 wrong PINs → lockout |
+| 1a | Contactless | 49.99 AUD | EUR |  No (under limit) | Payment + FX conversion |
+| 1b | Contactless | 150.00 AUD | USD | Yes (over limit) | PIN → payment + FX conversion |
+| 1c | Contact | 25.00 AUD | USD |  Yes (always) | PIN → payment + FX conversion |
+| 2  | Contactless | 20.00 AUD | EUR |  No (under limit) | 4 bad cards rejected, 5th succeeds |
+| 3  | Contactless | 150.00 AUD | USD |  Yes (over limit) | 3 wrong PINs → lockout |
 
 Demo card reference:
 
@@ -225,6 +225,3 @@ This is a demonstration project. A production system would add:
 
 ---
 
-## License
-
-MIT — see `LICENSE` for details.
